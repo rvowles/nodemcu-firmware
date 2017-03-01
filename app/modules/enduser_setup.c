@@ -50,7 +50,7 @@
 #include "task/task.h"
 
 /* Set this to 1 to generate debug messages. Uses debug callback provided by Lua. Example: enduser_setup.start(successFn, print, print) */ 
-#define ENDUSER_SETUP_DEBUG_ENABLE 0
+#define ENDUSER_SETUP_DEBUG_ENABLE 1
 
 /* Set this to 1 to output the contents of HTTP requests when debugging. Useful if you need it, but can get pretty noisy */
 #define ENDUSER_SETUP_DEBUG_SHOW_HTTP_REQUEST 0
@@ -347,7 +347,7 @@ static err_t force_abort (void *arg, struct tcp_pcb *pcb)
 /* Callback to detect a remote-close of a connection */
 static err_t handle_remote_close (void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
-  ENDUSER_SETUP_DEBUG("handle_remote_close");
+//  ENDUSER_SETUP_DEBUG("handle_remote_close");
     
   (void)arg; (void)err;
   if (p) /* server sent us data, just ACK and move on */
@@ -367,7 +367,7 @@ static err_t handle_remote_close (void *arg, struct tcp_pcb *pcb, struct pbuf *p
 /* Set up a deferred close of a connection, as discussed above. */
 static inline void deferred_close (struct tcp_pcb *pcb)
 {
-  ENDUSER_SETUP_DEBUG("deferred_close");
+//  ENDUSER_SETUP_DEBUG("deferred_close");
     
   tcp_poll (pcb, force_abort, 15); /* ~3sec from now */
   tcp_recv (pcb, handle_remote_close);
@@ -622,6 +622,90 @@ static void do_station_cfg (task_param_t param, uint8_t prio)
   luaM_free(lua_getstate(), cnf);
 }
 
+enum HTTP_FIELD_PARSER {
+  STATE_FIELD = 1,
+  STATE_DATA = 2,
+  STATE_FIN = 3
+};
+
+const int MAX_HTTP_FIELDS = 10;
+
+static int decode_http_queryparam(char *data, unsigned short data_len, char *fields[], char *values[]) {
+  unsigned int counter = 0;
+
+  int lastPos = -1;
+  int state = STATE_FIELD;
+  int pos;
+
+  ENDUSER_SETUP_DEBUG("Decoding PARAMETERS!!!!!");
+
+  for(pos = 0; pos < MAX_HTTP_FIELDS; pos ++) {
+    fields[pos] = values[pos] = NULL;
+  }
+
+  for (pos = 0; pos < data_len; pos++) {
+    if (data[pos] == '?' && (pos + 1 < data_len)) {
+      fields[counter] = &data[pos + 1];
+      break;
+    }
+  }
+
+  data[data_len] = 0; // this must be true by definition
+
+  ENDUSER_SETUP_DEBUG("Decoding found first field");
+
+
+  for (pos = 0; pos < data_len && counter < MAX_HTTP_FIELDS && state != STATE_FIN; pos++) {
+    ENDUSER_SETUP_DEBUG("Decoding loop");
+    //std::cout << "val" << pos << ":" << data[pos] << std::endl;
+    if (data[pos] == '&' || data[pos] == ';') { // w3c states & or ; separate params
+      if (lastPos != -1) {
+        data[pos] = 0; // terminate the string
+        counter++;
+
+        if (counter < MAX_HTTP_FIELDS) {
+          fields[counter] = NULL;
+          values[counter] = NULL;
+        }
+        state = STATE_FIELD;
+      } else { // invalid state, started with &, skip it
+
+      }
+    } else if (state == STATE_FIELD) {
+      if (data[pos] == '=') {
+        state = STATE_DATA;
+        data[pos] = 0;
+      } else {
+        if (fields[counter] == NULL) {
+          fields[counter] = &data[pos];
+        }
+      }
+    } else if (state == STATE_DATA) {
+      if (data[pos] == ' ') { // at the end - this is invalid query param, space is %20
+        counter ++;
+        data[pos] = 0;
+        state = STATE_FIN;
+      } else if (values[counter] == NULL) {
+        values[counter] = &data[pos];
+      }
+    }
+
+    lastPos = pos;
+  }
+
+  // we always fall out with one less than the actual number of fields
+  if (state == STATE_DATA) {
+    counter ++;
+  }
+
+  ENDUSER_SETUP_DEBUG("Decoding finished loop");
+
+  if (counter >= MAX_HTTP_FIELDS) {
+    counter = MAX_HTTP_FIELDS-1;
+  }
+
+  return counter;
+}
 
 /**
  * Handle HTTP Credentials
@@ -634,37 +718,90 @@ static int enduser_setup_http_handle_credentials(char *data, unsigned short data
 {
   ENDUSER_SETUP_DEBUG("enduser_setup_http_handle_credentials");
 
+  char *fields_str[MAX_HTTP_FIELDS];
+  char *values_str[MAX_HTTP_FIELDS];
+
   state->success = 0;
   state->lastStationStatus = 0;
-  
-  char *name_str = (char *) ((uint32_t)strstr(&(data[6]), "wifi_ssid="));
-  char *pwd_str = (char *) ((uint32_t)strstr(&(data[6]), "wifi_password="));
-  if (name_str == NULL || pwd_str == NULL)
+
+  // ideally we want to strip all of the params out of here, and save off the wifi ssid & password
+  // all other params should get written out to the defined file
+  int param_count = decode_http_queryparam(data, data_len, fields_str, values_str);
+
+  if (param_count == 0) {
+    ENDUSER_SETUP_DEBUG("No parameters found at all!");
+    return 1;
+  }
+
+  ENDUSER_SETUP_DEBUG("starting checking for fields");
+
+  char buf[20];
+  c_sprintf(buf, "param count %d", param_count);
+  ENDUSER_SETUP_DEBUG(buf);
+
+  int p_file = 0;
+  if (param_count > 2) {
+    p_file = vfs_open("enduser.json", "w");
+    if (p_file == 0) {
+      ENDUSER_SETUP_DEBUG("Can't write to file!");
+      return 1;
+    }
+    vfs_write(p_file, "{", 1);
+  }
+
+  int wifi_ssid_loc = -1;
+  int wifi_pwd_loc = -1;
+  int file_field_counter = 0;
+  char file_buf[200]; // 200 is the maximum size of any one field, stack ok for this?
+
+  for(int p_count = 0; p_count < param_count; p_count ++) {
+    ENDUSER_SETUP_DEBUG("checking field");
+    ENDUSER_SETUP_DEBUG(fields_str[p_count]);
+    ENDUSER_SETUP_DEBUG(values_str[p_count]);
+
+    if (c_strcmp(fields_str[p_count], "wifi_ssid") == 0) {
+      wifi_ssid_loc = p_count;
+    } else if (c_strcmp(fields_str[p_count], "wifi_password") == 0) {
+      wifi_pwd_loc = p_count;
+    } else if (p_file != 0) {
+      if (file_field_counter > 0) {
+        vfs_write(p_file, ",", 1);
+      }
+
+      file_field_counter ++;
+      vfs_write(p_file, "\"", 1);
+
+      enduser_setup_http_urldecode(file_buf, fields_str[p_count], c_strlen(fields_str[p_count]), 200);
+      vfs_write(p_file, file_buf, c_strlen(file_buf));
+      vfs_write(p_file, "\":\"", 3);
+
+      enduser_setup_http_urldecode(file_buf, values_str[p_count], c_strlen(values_str[p_count]), 200);
+      vfs_write(p_file, file_buf, c_strlen(file_buf));
+      vfs_write(p_file, "\"", 1);
+    }
+  }
+
+  if (p_file != 0) {
+    vfs_write(p_file, "}", 1);
+    vfs_close(p_file);
+  }
+
+  ENDUSER_SETUP_DEBUG("and out");
+
+  if (wifi_pwd_loc == -1 || wifi_ssid_loc == -1)
   {
     ENDUSER_SETUP_DEBUG("Password or SSID string not found");
     return 1;
   }
 
-  int name_field_len = LITLEN("wifi_ssid=");
-  int pwd_field_len = LITLEN("wifi_password=");
-  char *name_str_start = name_str + name_field_len;
-  char *pwd_str_start = pwd_str + pwd_field_len;
-
-  int name_str_len = enduser_setup_srch_str(name_str_start, "& ");
-  int pwd_str_len = enduser_setup_srch_str(pwd_str_start, "& ");
-  if (name_str_len == -1 || pwd_str_len == -1)
-  {
-    ENDUSER_SETUP_DEBUG("Password or SSID HTTP paramter divider not found");
-    return 1;
-  }
-
+  ENDUSER_SETUP_DEBUG("showing values");
 
   struct station_config *cnf = luaM_malloc(lua_getstate(), sizeof(struct station_config));
   c_memset(cnf, 0, sizeof(struct station_config));
 
   int err;
-  err  = enduser_setup_http_urldecode(cnf->ssid, name_str_start, name_str_len, sizeof(cnf->ssid));
-  err |= enduser_setup_http_urldecode(cnf->password, pwd_str_start, pwd_str_len, sizeof(cnf->password));
+  err  = enduser_setup_http_urldecode(cnf->ssid, values_str[wifi_ssid_loc], c_strlen(values_str[wifi_ssid_loc]), sizeof(cnf->ssid));
+  err |= enduser_setup_http_urldecode(cnf->password, values_str[wifi_pwd_loc], c_strlen(values_str[wifi_pwd_loc]), sizeof(cnf->password));
   if (err != 0 || c_strlen(cnf->ssid) == 0)
   {
     ENDUSER_SETUP_DEBUG("Unable to decode HTTP parameter to valid password or SSID");
@@ -1132,9 +1269,9 @@ static err_t enduser_setup_http_recvcb(void *arg, struct tcp_pcb *http_client, s
 
   err_t ret = ERR_OK;
 
-#if ENDUSER_SETUP_DEBUG_SHOW_HTTP_REQUEST
+//#if ENDUSER_SETUP_DEBUG_SHOW_HTTP_REQUEST
   ENDUSER_SETUP_DEBUG(data);
-#endif
+//#endif
 
   if (c_strncmp(data, "GET ", 4) == 0)
   {
@@ -1232,7 +1369,7 @@ static err_t enduser_setup_http_recvcb(void *arg, struct tcp_pcb *http_client, s
     }
     else
     {
-      ENDUSER_SETUP_DEBUG("serving 404");
+//      ENDUSER_SETUP_DEBUG("serving 404");
       enduser_setup_http_serve_header(http_client, http_header_404, LITLEN(http_header_404));
     }
   }
@@ -1254,7 +1391,7 @@ free_out:
 
 static err_t enduser_setup_http_connectcb(void *arg, struct tcp_pcb *pcb, err_t err)
 {
-  ENDUSER_SETUP_DEBUG("enduser_setup_http_connectcb");
+//  ENDUSER_SETUP_DEBUG("enduser_setup_http_connectcb");
 
   if (!state)
   {
