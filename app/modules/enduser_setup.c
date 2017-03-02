@@ -766,7 +766,7 @@ static int enduser_find_wifi_pwd_loc(int param_count, char *fields_str[],
     }
   }
 
-  char file_buf[max_len];
+  char file_buf[max_len+1];
 
   // make sure  you don't return in here as Lua is set up ready for a call
   for (int p_count = 0; p_count < param_count; p_count++) {
