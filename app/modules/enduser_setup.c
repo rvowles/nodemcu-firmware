@@ -722,14 +722,27 @@ static void enduser_extract_validation_result(lua_State *L, enduser_Validation_R
   lua_getfield( L, idx, "body" );
 
   val->status = luaL_optint( L, ++idx, 200 );
-  val->content_type =  c_strdup(luaL_optlstring(L, ++idx, NULL, 0));
-  val->body =  c_strdup(luaL_optlstring(L, ++idx, NULL, 0));
+  val->content_type =  luaL_optlstring(L, ++idx, NULL, 0);
+  val->body =  luaL_optlstring(L, ++idx, NULL, 0);
 
-  lua_pop( L, 2 );
+  if (val->content_type) {
+    val->content_type = c_strdup(val->content_type);
+  }
+
+  if (val->body) {
+    val->body = c_strdup(val->body);
+  }
+
+  lua_pop( L, 3 );
 }
 
 static void enduser_cleanup_validation_result(enduser_Validation_Result* val) {
-  os_free(val->body);
+  if (val->body != NULL) {
+    os_free((void *)val->body);
+  }
+  if (val->content_type != NULL) {
+    os_free((void *)val->content_type);
+  }
 }
 
 static int enduser_find_wifi_pwd_loc(int param_count, char *fields_str[],
@@ -739,11 +752,13 @@ static int enduser_find_wifi_pwd_loc(int param_count, char *fields_str[],
   lua_State *L = NULL;
 
   if (param_count > 2) {
-    L = lua_getstate();
     if (state != NULL && state->lua_validation_cb_ref != LUA_NOREF) {
+      ENDUSER_SETUP_DEBUG("opening lua state");
+      L = lua_getstate();
       lua_rawgeti(L, LUA_REGISTRYINDEX, state->lua_validation_cb_ref);
       lua_createtable( L, 0, param_count - 2 );
     }
+    ENDUSER_SETUP_DEBUG("setting up file output");
     // setup the file output
     p_file = vfs_open("enduser.json", "w");
     if (p_file == 0) {
@@ -760,7 +775,7 @@ static int enduser_find_wifi_pwd_loc(int param_count, char *fields_str[],
     if (len > max_len) {
       max_len = len;
     }
-    int len = c_strlen(values_str[p_count]);
+    len = c_strlen(values_str[p_count]);
     if (len > max_len) {
       max_len = len;
     }
@@ -812,6 +827,7 @@ static int enduser_find_wifi_pwd_loc(int param_count, char *fields_str[],
     ENDUSER_SETUP_DEBUG("calling lua for validation");
     lua_call(L, 1, 1);
     // did we get a table back? should have a status and body
+    ENDUSER_SETUP_DEBUG("checking if lua table");
     if (lua_type( L, lua_gettop( L ) ) == LUA_TTABLE) {
       enduser_extract_validation_result(L, validation);
     }
@@ -859,11 +875,17 @@ static int enduser_setup_http_handle_credentials(char *data, unsigned short data
   // set the defaults
   validation->status = 0;
   validation->body = NULL;
+  validation->content_type = NULL;
+
   int wifi_ssid_loc = -1;
   int wifi_pwd_loc = -1;
 
-  if (enduser_find_wifi_pwd_loc(param_count, fields_str, values_str, &validation, &wifi_ssid_loc, &wifi_pwd_loc) > 0) {
+  if (enduser_find_wifi_pwd_loc(param_count, fields_str, values_str, validation, &wifi_ssid_loc, &wifi_pwd_loc) > 0) {
     return 1;
+  }
+
+  if (validation->status != 0 && validation->status != 200) {
+    return 2;
   }
 
   if (wifi_pwd_loc == -1 || wifi_ssid_loc == -1) {
@@ -873,12 +895,6 @@ static int enduser_setup_http_handle_credentials(char *data, unsigned short data
 
   ENDUSER_SETUP_DEBUG("showing values");
 
-  if (validation->status != 0) {
-    return 2;
-  }
-
-  return 1;
-
   struct station_config *cnf = luaM_malloc(lua_getstate(), sizeof(struct station_config));
   c_memset(cnf, 0, sizeof(struct station_config));
 
@@ -887,12 +903,12 @@ static int enduser_setup_http_handle_credentials(char *data, unsigned short data
                                       c_strlen(values_str[wifi_ssid_loc]), sizeof(cnf->ssid));
   err |= enduser_setup_http_urldecode(cnf->password, values_str[wifi_pwd_loc],
                                       c_strlen(values_str[wifi_pwd_loc]), sizeof(cnf->password));
+
   if (err != 0 || c_strlen(cnf->ssid) == 0)
   {
     ENDUSER_SETUP_DEBUG("Unable to decode HTTP parameter to valid password or SSID");
     return 1;
   }
-
 
   ENDUSER_SETUP_DEBUG("");
   ENDUSER_SETUP_DEBUG("WiFi Credentials Stored");
@@ -925,6 +941,8 @@ static int enduser_setup_http_serve_header(struct tcp_pcb *http_client, const ch
     deferred_close (http_client);
     ENDUSER_SETUP_ERROR("http_serve_header failed on tcp_write", ENDUSER_SETUP_ERR_UNKOWN_ERROR, ENDUSER_SETUP_ERR_NONFATAL);
   }
+
+  ENDUSER_SETUP_DEBUG("enduser_setup_http_serve_header");
 
   return 0;
 }
@@ -1139,6 +1157,7 @@ static void enduser_setup_serve_validation(struct tcp_pcb *http_client, enduser_
 
   int b_len = validation->body == NULL ? 0 : c_strlen(validation->body);
 
+  // NUMLEN is indicating the size of a number (e.g 345 = len 3)
   char buf[c_strlen(fmt) + NUMLEN(len) + b_len - 6 + c_len + NUMLEN(validation->status) ]; // should be -8 but...
 
   b_len =c_sprintf(buf, fmt, validation->status, b_len, c_buf, validation->body == NULL ? "" : validation->body);
@@ -1460,6 +1479,7 @@ static err_t enduser_setup_http_recvcb(void *arg, struct tcp_pcb *http_client, s
           enduser_setup_http_serve_header(http_client, http_header_400, LITLEN(http_header_400));
           break;
         case 2:
+          enduser_setup_serve_validation(http_client, &validation);
           break;
         default:
           ENDUSER_SETUP_ERROR("http_recvcb failed. Failed to handle wifi credentials.", ENDUSER_SETUP_ERR_UNKOWN_ERROR, ENDUSER_SETUP_ERR_NONFATAL);
@@ -1479,6 +1499,7 @@ static err_t enduser_setup_http_recvcb(void *arg, struct tcp_pcb *http_client, s
           enduser_setup_http_serve_header(http_client, http_header_400, LITLEN(http_header_400));
           break;
         case 2:
+          enduser_setup_serve_validation(http_client, &validation);
           break;
         default:
           ENDUSER_SETUP_ERROR("http_recvcb failed. Failed to handle wifi credentials.", ENDUSER_SETUP_ERR_UNKOWN_ERROR, ENDUSER_SETUP_ERR_NONFATAL);
