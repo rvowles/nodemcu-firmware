@@ -78,6 +78,8 @@ a new field is missing if you are doing OTA (over the air) updates).
 
 Any extra parameters (field/value combinations) passed to the esp will be saved in a file called `enduser.json` in json format.
 
+*Note: wifi ssid and password are not stored in enduser.json or passed to validation.*
+
 #### Syntax
 `enduser_setup.start([onConnected()], [onError(err_num, string)], [onDebug(string)], [onValidation(table)])`
 
@@ -88,7 +90,7 @@ Any extra parameters (field/value combinations) passed to the esp will be saved 
  - `onValidation()` callback if there are fields other than wifi ssid and password passed. expects either no return or a table
  consisting of a status (mandatory), content_type and body (both optional). This method is optional and 
  extra fields will still be stored in the enduser.json file regardless of whether they pass
- validation.
+ validation. 
 
 #### Returns
 `nil`
